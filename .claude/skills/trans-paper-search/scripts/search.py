@@ -186,8 +186,8 @@ class Http:
                 # 404 是「查無此文」，屬於有效答案，不重試
                 if exc.code == 404:
                     return None
-                # 429/5xx 退避重試；其餘直接放棄
-                if exc.code not in (429, 500, 502, 503, 504) or attempt == self.retries:
+                # 429/5xx 退避重試；406 對 arXiv 是已知的間歇性 CDN 抖動，一併重試
+                if exc.code not in (406, 429, 500, 502, 503, 504) or attempt == self.retries:
                     self._log(f"HTTP {exc.code} {url}")
                     self.failures += 1
                     return None
@@ -236,7 +236,6 @@ def search_openalex(http: Http, query: str, rounds: int, per_page: int,
             "per-page": per_page,
             "page": page,
             "mailto": http.email,
-            "sort": "cited_by_count:desc",
         }
         if from_year:
             params["filter"] = f"from_publication_date:{from_year}-01-01"
@@ -829,4 +828,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # ponytail: Windows 主控台常用 cp950，論文標題常含 cp950 編不到的
+    # Unicode 標點（如 ‐），改用 replace 避免整條管線因單一字元當機
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
     sys.exit(main())

@@ -114,6 +114,14 @@ BibTeX 檔只輸出「已驗證」與「未驗證」兩類，「查無此文」�
 
 動手前請確認所屬機構與投稿期刊的生成式 AI 使用規範，該揭露就揭露。
 
+### `--sources` 拿掉 `arxiv` 的影響
+
+某些網路環境下（校園網路的安全閘道、防毒軟體的網頁防護等）arXiv 的請求會被中途插入 HTTP 406，重試也無效，但問題不在 arXiv 本身或這支腳本——同樣的請求換一個獨立的呼叫環境就會成功。若遇到這種情況、想先跳過 arXiv（`--sources openalex,s2`）：
+
+- **不是完全沒有 arXiv 論文。** Semantic Scholar 自己就有索引大量 arXiv 預印本（DOI 前綴 `10.48550/arxiv.*`），實測中拿掉 arxiv 來源後，S2 仍帶回了同主題的 arXiv 預印本。
+- **但驗證狀態會變嚴重。** 原生 arXiv 來源抓到的無 DOI 論文標記「未驗證」（人工確認來源與年份後可引用，會進 BibTeX）；同一篇論文若只透過 S2 拿到、且 S2 附的是 `10.48550/arxiv` 這個 DataCite 而非 Crossref 登記的 DOI，Crossref 對帳查不到，會被標成「查無此文」——這個狀態**不會**寫進 BibTeX，即使論文內容其實沒問題。換句話說，拿掉 arxiv 來源不會讓你漏掉這些預印本，但會讓一部分原本可標「未驗證、人工確認後可引用」的論文，被更嚴格地擋在 BibTeX 之外，需要另外手動加回去。
+- **最新的預印本可能真的漏掉。** S2 收錄 arXiv 有落後期，剛掛上去沒幾天的論文，原生 arXiv 來源抓得到但 S2 可能還沒有。
+
 ## 離線測試
 
 改動腳本後跑這套測試（以假 API 回應取代網路，不需連線）：
@@ -131,7 +139,7 @@ python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py -v   # 逐項
 - 三種篩選條件與排除清單的正規化
 - Crossref 四種驗證狀態、年份容差、相似度門檻可調、Crossref 未提供標題時不誤判
 - Unpaywall 的 PDF／landing page 取用優先序與無 DOI 略過
-- HTTP 層：429／5xx 退避重試、404 視為有效答案不重試也不計失敗、其他 4xx 不重試、連線失敗計數、畸形 JSON 與畸形 XML
+- HTTP 層：429／5xx／406 退避重試、404 視為有效答案不重試也不計失敗、其餘 4xx 不重試、連線失敗計數、畸形 JSON 與畸形 XML
 - 三個來源的參數下達（mailto、年限、offset、API key）與分頁前進／停止
 - `--patience` 與 `--target` 停止條件確實減少 API 請求次數
 - BibTeX：entry 類型、citation key 取姓、key 衝突加序號、LaTeX 特殊字元單次轉義
