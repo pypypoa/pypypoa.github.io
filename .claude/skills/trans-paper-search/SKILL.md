@@ -16,7 +16,8 @@ description: 交通運輸領域的文獻檢索與驗證管線。並列檢索 Ope
            ↓
 篩選     出版年限／最低引用數／排除期刊清單（掠奪性期刊）
            ↓
-驗證     逐筆拿 DOI 回 Crossref 對帳：DOI 存在？標題相似度 ≥ 門檻？年份差距 ≤ 1 年？
+驗證     逐筆拿 DOI 對帳：先 Crossref，查無再 DataCite（arXiv／Zenodo 等）
+         標題相似度 ≥ 門檻？年份差距 ≤ 1 年？
            ↓
 全文     Unpaywall 依 DOI 找合法 OA PDF
            ↓
@@ -31,6 +32,7 @@ description: 交通運輸領域的文獻檢索與驗證管線。並列檢索 Ope
 | **Semantic Scholar** | 語意檢索與補漏 | 補 OpenAlex 漏掉的，並提供較準的引用數 |
 | **arXiv** | 預印本 | 交通流理論、深度學習需求預測、強化學習號誌控制 |
 | **Crossref** | 驗證層（**不負責找**） | DOI 的權威來源，只用來對帳 |
+| **DataCite** | 驗證層的備援（**不負責找**） | arXiv（`10.48550/*`）、Zenodo、Figshare、政府資料集的 DOI 是向 DataCite 而非 Crossref 登記的。Crossref 查無時改查這裡，避免把真實存在的 DOI 誤判為假的 |
 | **Unpaywall** | 取全文 | 只取合法開放取用連結 |
 
 ## 使用方式
@@ -69,7 +71,7 @@ python3 .claude/skills/trans-paper-search/scripts/search.py \
 | `--max-rounds` | 4 | 每來源最多輪數 |
 | `--patience` | 2 | 連續幾輪無新命中即停止 |
 | `--title-threshold` | 0.90 | Crossref 對帳的標題相似度門檻 |
-| `--no-verify` / `--no-oa` | 關 | 跳過驗證／取全文（**不建議跳過驗證**） |
+| `--no-verify` / `--no-oa` | 關 | 跳過 DOI 對帳／取全文（**不建議跳過驗證**） |
 
 停止條件是「連續 `--patience` 輪沒有新命中就停手」，加上累積達 `--target` 三倍候選即停（留餘裕給後續篩選與驗證淘汰）。檢索函式是產生器，所以停止條件會**真的不再發出後續請求**，而不是抓完才丟棄——這對 OpenAlex polite pool 與 Semantic Scholar 的限流都有意義。
 
@@ -77,16 +79,19 @@ python3 .claude/skills/trans-paper-search/scripts/search.py \
 
 三個檔案：`<prefix>.csv`、`<prefix>.bib`、`<prefix>-search-log.md`。
 
-CSV 第一欄 `verification` 是四種狀態，務必逐欄判讀：
+CSV 第一欄 `verification` 是五種狀態，第二欄 `registry` 記錄是哪個註冊機構對上的，務必逐筆判讀：
 
 | 狀態 | 意思 | 可以引用嗎 |
 |---|---|---|
-| **已驗證** | DOI 存在於 Crossref，標題與年份吻合 | 可以。書目欄位已用 Crossref 的權威值覆寫 |
+| **已驗證** | DOI 由 Crossref 登記，標題與年份吻合 | 可以。書目欄位已用 Crossref 的權威值覆寫 |
+| **已驗證（DataCite）** | DOI 由 DataCite 登記（arXiv、Zenodo、政府資料集），標題與年份吻合 | 可以，但**多為預印本或資料集**。引用前確認是否已有正式發表版本，若有則改引正式版 |
 | **欄位不符** | DOI 存在，但標題相似度過低或年份差超過一年 | **不可直接引用**，須人工判讀（可能是檢索來源的 metadata 有誤，也可能是 DOI 掛錯） |
-| **查無此文** | Crossref 查不到此 DOI | **絕對不可引用** |
-| **未驗證** | 無 DOI（arXiv 預印本、會議論文常見），Crossref 無法對帳 | 須人工確認來源網址與年份後才引用 |
+| **查無此文** | Crossref 與 DataCite 都查不到此 DOI | **絕對不可引用** |
+| **未驗證** | 無 DOI（會議論文、原生 arXiv 來源常見），無法對帳 | 須人工確認來源網址與年份後才引用 |
 
-BibTeX 檔只輸出「已驗證」與「未驗證」兩類，「查無此文」與「欄位不符」不會進書目檔，避免被誤引。每筆 `note` 欄位都標著驗證狀態。
+BibTeX 檔輸出「已驗證」、「已驗證（DataCite）」與「未驗證」三類，「查無此文」與「欄位不符」不會進書目檔，避免被誤引。每筆 `note` 欄位都標著驗證狀態。
+
+`authority_title` / `authority_year` / `authority_venue` 三欄留著註冊機構登記的原值，當狀態是「欄位不符」時，靠這三欄跟你檢索到的值對照就能看出是哪裡對不上。
 
 檢索紀錄（Markdown）含檢索條件、逐輪命中數、各階段筆數與 API 呼叫統計，可直接改寫成論文方法章節的「文獻檢索策略」一節，也是投稿時生成式 AI 使用揭露的依據。
 
@@ -116,10 +121,11 @@ BibTeX 檔只輸出「已驗證」與「未驗證」兩類，「查無此文」�
 
 ### `--sources` 拿掉 `arxiv` 的影響
 
-某些網路環境下（校園網路的安全閘道、防毒軟體的網頁防護等）arXiv 的請求會被中途插入 HTTP 406，重試也無效，但問題不在 arXiv 本身或這支腳本——同樣的請求換一個獨立的呼叫環境就會成功。若遇到這種情況、想先跳過 arXiv（`--sources openalex,s2`）：
+某些網路環境下（校園網路的安全閘道、防毒軟體的網頁防護等）arXiv 的請求會被中途插入 HTTP 406，重試也無效，但問題不在 arXiv 本身或這支腳本——同樣的請求換一個獨立的呼叫環境就會成功。因為重試無效，腳本對 406 **不做重試**（省下退避的等待），並在結束時指名是哪個主機、提示可改用 `--sources openalex,s2`。若要先跳過 arXiv：
 
 - **不是完全沒有 arXiv 論文。** Semantic Scholar 自己就有索引大量 arXiv 預印本（DOI 前綴 `10.48550/arxiv.*`），實測中拿掉 arxiv 來源後，S2 仍帶回了同主題的 arXiv 預印本。
-- **但驗證狀態會變嚴重。** 原生 arXiv 來源抓到的無 DOI 論文標記「未驗證」（人工確認來源與年份後可引用，會進 BibTeX）；同一篇論文若只透過 S2 拿到、且 S2 附的是 `10.48550/arxiv` 這個 DataCite 而非 Crossref 登記的 DOI，Crossref 對帳查不到，會被標成「查無此文」——這個狀態**不會**寫進 BibTeX，即使論文內容其實沒問題。換句話說，拿掉 arxiv 來源不會讓你漏掉這些預印本，但會讓一部分原本可標「未驗證、人工確認後可引用」的論文，被更嚴格地擋在 BibTeX 之外，需要另外手動加回去。
+- **驗證狀態會不同，但不再被誤擋。** 原生 arXiv 來源抓到的無 DOI 論文標記「未驗證」；同一篇若只透過 S2 拿到、附的是 `10.48550/arxiv` 這個 DataCite 登記的 DOI，則會標成「已驗證（DataCite）」。兩者都可引用、都會進 BibTeX。
+  （早期版本只查 Crossref，會把這種 DOI 誤判為「查無此文」並擋在 BibTeX 外，需要手動加回去；補上 DataCite 備援後已修正。）
 - **最新的預印本可能真的漏掉。** S2 收錄 arXiv 有落後期，剛掛上去沒幾天的論文，原生 arXiv 來源抓得到但 S2 可能還沒有。
 
 ## 離線測試
@@ -131,15 +137,16 @@ python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py      # 摘要
 python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py -v   # 逐項
 ```
 
-共 40 項，涵蓋：
+共 44 項，涵蓋：
 
 - 標題／DOI 正規化、相似度、作者姓名三種格式（`Wei, Hua`／`Hua Wei`／中文）
 - OpenAlex 反向索引摘要還原
 - 去重：DOI 大小寫與前綴差異、有 DOI 與無 DOI 的雙向合併、三來源接續合併後的索引重建、不同文獻不被誤併
 - 三種篩選條件與排除清單的正規化
-- Crossref 四種驗證狀態、年份容差、相似度門檻可調、Crossref 未提供標題時不誤判
+- 五種驗證狀態、年份容差、相似度門檻可調、Crossref 未提供標題時不誤判
+- DataCite 備援：Crossref 查無時改查 DataCite、Crossref 命中則不多打一次、DataCite 標題不符判為「欄位不符」而非「查無此文」、兩邊都查無才是「查無此文」、DOI 大小寫自行正規化、publisher 為物件的新版 schema
 - Unpaywall 的 PDF／landing page 取用優先序與無 DOI 略過
-- HTTP 層：429／5xx／406 退避重試、404 視為有效答案不重試也不計失敗、其餘 4xx 不重試、連線失敗計數、畸形 JSON 與畸形 XML
+- HTTP 層：429／5xx 退避重試、404 視為有效答案不重試也不計失敗、406 不重試並記下疑似被阻擋的主機、其餘 4xx 不重試、連線失敗計數、畸形 JSON 與畸形 XML
 - 三個來源的參數下達（mailto、年限、offset、API key）與分頁前進／停止
 - `--patience` 與 `--target` 停止條件確實減少 API 請求次數
 - BibTeX：entry 類型、citation key 取姓、key 衝突加序號、LaTeX 特殊字元單次轉義
@@ -148,4 +155,5 @@ python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py -v   # 逐項
 - 「查無文獻」（exit 0）與「連線失敗」（exit 3）必須區分
 
 > 這套測試不含對真實 API 的呼叫。第一次在自己的網路環境使用前，建議先
-> `--max-rounds 1 --target 5 -v` 小跑一次，確認五個 API 都通得到。
+> `--max-rounds 1 --target 5 -v` 小跑一次，確認六個 API 都通得到
+> （OpenAlex、Semantic Scholar、arXiv、Crossref、DataCite、Unpaywall）。

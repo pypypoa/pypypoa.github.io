@@ -7,6 +7,7 @@
     去重    DOI 為主鍵；無 DOI 者用 標題正規化 + 第一作者姓 + 年份
       ↓
     驗證    逐筆拿 DOI 回 Crossref 對帳（存在？標題吻合？年份吻合？）
+            Crossref 查無時再查 DataCite（arXiv、Zenodo 等走 DataCite 登記）
       ↓
     全文    Unpaywall 依 DOI 找合法 OA PDF
       ↓
@@ -41,6 +42,7 @@ OPENALEX_API = "https://api.openalex.org/works"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
 ARXIV_API = "https://export.arxiv.org/api/query"
 CROSSREF_API = "https://api.crossref.org/works/"
+DATACITE_API = "https://api.datacite.org/dois/"
 UNPAYWALL_API = "https://api.unpaywall.org/v2/"
 
 S2_FIELDS = "title,year,venue,citationCount,externalIds,authors,abstract,openAccessPdf"
@@ -68,9 +70,10 @@ class Record:
     # 驗證階段填入
     verification: str = "未驗證"
     verify_note: str = ""
-    crossref_title: str = ""
-    crossref_year: int | None = None
-    crossref_venue: str = ""
+    registry: str = ""          # 是哪個註冊機構對上的：Crossref 或 DataCite
+    authority_title: str = ""   # 註冊機構登記的權威欄位，供人工判讀
+    authority_year: int | None = None
+    authority_venue: str = ""
     # 全文階段填入
     oa_status: str = ""
     oa_pdf_url: str = ""
@@ -148,6 +151,9 @@ class Http:
         self.verbose = verbose
         self.calls = 0
         self.failures = 0  # 放棄的請求數，用來區分「查無結果」與「連線失敗」
+        # 回過 406 的主機。實測是校園閘道／防毒軟體的網頁防護插進來的，
+        # 重試不會變好，所以不重試，只記下來在最後給一次明確提示。
+        self.middlebox_hosts: set[str] = set()
 
     def get_json(self, url: str, params: dict | None = None,
                  headers: dict | None = None) -> dict | None:
@@ -186,8 +192,14 @@ class Http:
                 # 404 是「查無此文」，屬於有效答案，不重試
                 if exc.code == 404:
                     return None
-                # 429/5xx 退避重試；406 對 arXiv 是已知的間歇性 CDN 抖動，一併重試
-                if exc.code not in (406, 429, 500, 502, 503, 504) or attempt == self.retries:
+                # 406 是網路中間設備插進來的，重試只會白等退避時間
+                if exc.code == 406:
+                    self.middlebox_hosts.add(urllib.parse.urlsplit(url).netloc)
+                    self._log(f"HTTP 406 {url}（疑似網路中間設備阻擋，不重試）")
+                    self.failures += 1
+                    return None
+                # 429/5xx 退避重試；其餘直接放棄
+                if exc.code not in (429, 500, 502, 503, 504) or attempt == self.retries:
                     self._log(f"HTTP {exc.code} {url}")
                     self.failures += 1
                     return None
@@ -428,50 +440,109 @@ class Deduper:
 # 驗證層（Crossref 對帳）
 # --------------------------------------------------------------------------- #
 
-def verify_with_crossref(http: Http, rec: Record, title_threshold: float) -> None:
-    if not rec.doi:
-        rec.verification = "未驗證"
-        rec.verify_note = "無 DOI，Crossref 無法對帳（預印本或非 DOI 來源需人工確認）"
-        return
-
-    data = http.get_json(f"{CROSSREF_API}{urllib.parse.quote(rec.doi)}",
+def fetch_crossref(http: Http, doi: str) -> tuple[str, int | None, str] | None:
+    """向 Crossref 查一筆 DOI。回傳 (標題, 年份, 期刊) 或 None（查無）。"""
+    data = http.get_json(f"{CROSSREF_API}{urllib.parse.quote(doi)}",
                          {"mailto": http.email})
     msg = (data or {}).get("message")
     if not msg:
-        rec.verification = "查無此文"
-        rec.verify_note = "Crossref 查不到此 DOI —— 不可直接寫進文獻回顧"
-        return
-
+        return None
     titles = msg.get("title") or []
-    cr_title = titles[0] if titles else ""
     containers = msg.get("container-title") or []
     issued = ((msg.get("issued") or {}).get("date-parts") or [[None]])[0]
-    cr_year = issued[0] if issued and isinstance(issued[0], int) else None
+    year = issued[0] if issued and isinstance(issued[0], int) else None
+    return (titles[0] if titles else "",
+            year,
+            containers[0] if containers else "")
 
-    rec.crossref_title = cr_title
-    rec.crossref_year = cr_year
-    rec.crossref_venue = containers[0] if containers else ""
+
+def fetch_datacite(http: Http, doi: str) -> tuple[str, int | None, str] | None:
+    """向 DataCite 查一筆 DOI。回傳 (標題, 年份, 出版者) 或 None（查無）。
+
+    arXiv（10.48550/*）、Zenodo、Figshare 與多國政府資料集的 DOI 是向
+    DataCite 而非 Crossref 登記的。它們是正式註冊、真實存在的 DOI，
+    只查 Crossref 會 404，不能因此判定為「查無此文」。
+    """
+    data = http.get_json(f"{DATACITE_API}{urllib.parse.quote(doi)}")
+    attrs = ((data or {}).get("data") or {}).get("attributes")
+    if not attrs:
+        return None
+    titles = attrs.get("titles") or []
+    title = ""
+    for t in titles:
+        if isinstance(t, dict) and t.get("title"):
+            title = t["title"]
+            break
+    year = attrs.get("publicationYear")
+    if not isinstance(year, int):
+        year = None
+    # DataCite 沒有 container-title 的對等欄位；用 publisher 當發表處
+    venue = attrs.get("publisher") or ""
+    if isinstance(venue, dict):  # 新版 schema 可能是物件
+        venue = venue.get("name") or ""
+    return title, year, venue
+
+
+def verify_record(http: Http, rec: Record, title_threshold: float) -> None:
+    """逐筆對帳：先 Crossref，查無再 DataCite，兩邊都查無才是「查無此文」。
+
+    驗證狀態共五種：
+        已驗證              Crossref 登記，標題與年份吻合
+        已驗證（DataCite）  DataCite 登記（arXiv/Zenodo 等），標題與年份吻合
+        欄位不符            DOI 存在，但標題或年份對不上，需人工判讀
+        查無此文            Crossref 與 DataCite 都查不到，不可引用
+        未驗證              無 DOI，無法對帳，須人工確認
+    """
+    # 自行正規化，不依賴呼叫端先做過：S2 回的 arXiv DOI 帶大寫
+    # （10.48550/arXiv.xxxx），直接拿去查會對不上註冊機構的記錄
+    doi = rec.doi_key
+    if not doi:
+        rec.verification = "未驗證"
+        rec.verify_note = "無 DOI，無法向註冊機構對帳（預印本或非 DOI 來源需人工確認）"
+        return
+
+    found = fetch_crossref(http, doi)
+    registry = "Crossref"
+    if found is None:
+        found = fetch_datacite(http, doi)
+        registry = "DataCite"
+
+    if found is None:
+        rec.verification = "查無此文"
+        rec.verify_note = "Crossref 與 DataCite 都查不到此 DOI —— 不可寫進文獻回顧"
+        return
+
+    auth_title, auth_year, auth_venue = found
+    rec.registry = registry
+    rec.authority_title = auth_title
+    rec.authority_year = auth_year
+    rec.authority_venue = auth_venue
 
     problems = []
-    sim = title_similarity(rec.title, cr_title)
-    if cr_title and sim < title_threshold:
+    sim = title_similarity(rec.title, auth_title)
+    if auth_title and sim < title_threshold:
         problems.append(f"標題相似度 {sim:.2f} 低於門檻 {title_threshold:.2f}")
-    if rec.year and cr_year and abs(rec.year - cr_year) > 1:
-        problems.append(f"年份不符（檢索 {rec.year} / Crossref {cr_year}）")
+    if rec.year and auth_year and abs(rec.year - auth_year) > 1:
+        problems.append(f"年份不符（檢索 {rec.year} / {registry} {auth_year}）")
 
     if problems:
         rec.verification = "欄位不符"
-        rec.verify_note = "；".join(problems)
-    else:
-        rec.verification = "已驗證"
-        rec.verify_note = f"DOI 存在，標題相似度 {sim:.2f}"
-        # 以 Crossref 的權威欄位覆寫
-        if cr_title:
-            rec.title = cr_title
-        if cr_year:
-            rec.year = cr_year
-        if rec.crossref_venue:
-            rec.venue = rec.crossref_venue
+        rec.verify_note = f"{registry} 有此 DOI，但 " + "；".join(problems)
+        return
+
+    rec.verification = "已驗證" if registry == "Crossref" else "已驗證（DataCite）"
+    rec.verify_note = f"{registry} 登記，標題相似度 {sim:.2f}"
+    # 以註冊機構的權威欄位覆寫
+    if auth_title:
+        rec.title = auth_title
+    if auth_year:
+        rec.year = auth_year
+    if auth_venue:
+        rec.venue = auth_venue
+
+
+# 舊名保留，避免既有呼叫端斷掉
+verify_with_crossref = verify_record
 
 
 # --------------------------------------------------------------------------- #
@@ -495,9 +566,9 @@ def fetch_oa(http: Http, rec: Record) -> None:
 # --------------------------------------------------------------------------- #
 
 CSV_COLUMNS = [
-    "verification", "verify_note", "title", "authors", "year", "venue", "doi",
-    "citations", "sources", "oa_status", "oa_pdf_url", "url",
-    "crossref_title", "crossref_year", "crossref_venue", "abstract",
+    "verification", "registry", "verify_note", "title", "authors", "year",
+    "venue", "doi", "citations", "sources", "oa_status", "oa_pdf_url", "url",
+    "authority_title", "authority_year", "authority_venue", "abstract",
 ]
 
 
@@ -584,7 +655,7 @@ LOG_TEMPLATE = """# 文獻檢索紀錄（trans-paper-search）
 | 最大輪數 | {max_rounds} |
 | 停止條件 | 連續 {patience} 輪無新命中即停止；或達到目標筆數 {target} |
 | 去重規則 | DOI 為主鍵；無 DOI 者以「標題正規化 + 第一作者姓 + 年份」比對 |
-| 驗證規則 | 逐筆以 DOI 查詢 Crossref，標題相似度 ≥ {threshold} 且年份差距 ≤ 1 年方標記「已驗證」 |
+| 驗證規則 | 逐筆以 DOI 查詢 Crossref，查無再查 DataCite；標題相似度 ≥ {threshold} 且年份差距 ≤ 1 年方標記為已驗證 |
 | 全文來源 | Unpaywall（僅取合法開放取用連結） |
 
 ## 二、逐輪命中紀錄
@@ -598,9 +669,10 @@ LOG_TEMPLATE = """# 文獻檢索紀錄（trans-paper-search）
 | 各來源原始命中合計 | {raw_total} |
 | 去重後 | {deduped} |
 | 通過篩選條件（年限／引用數／排除期刊） | {filtered} |
-| Crossref 已驗證 | {verified} |
+| 已驗證（Crossref 登記） | {verified} |
+| 已驗證（DataCite 登記，如 arXiv、Zenodo） | {verified_datacite} |
 | 欄位不符（需人工判讀） | {mismatch} |
-| 查無此文（不得引用） | {notfound} |
+| 查無此文（Crossref 與 DataCite 都查不到，不得引用） | {notfound} |
 | 無 DOI 未驗證（預印本等，需人工確認） | {unverified} |
 | 取得合法 OA 全文連結 | {oa_found} |
 
@@ -611,6 +683,8 @@ LOG_TEMPLATE = """# 文獻檢索紀錄（trans-paper-search）
    出版品**等交通領域關鍵來源未包含在內，須另行人工檢索，並在方法章節註明為
    「非 API 取得」。
 2. 標記為「查無此文」與「欄位不符」的書目**不得**直接寫進文獻回顧。
+   「已驗證（DataCite）」是正式註冊的 DOI（arXiv、Zenodo 等），可以引用，
+   但多為預印本或資料集，引用前請確認是否已有正式發表版本。
 3. 本工具解決的是檢索與驗證的可靠度，不解決判斷。哪篇文獻對研究問題重要、
    理論觀點之間如何對話、研究缺口在哪裡，仍是研究者自己的工作。
 4. 動手前請確認所屬機構與投稿期刊的生成式 AI 使用規範，該揭露就揭露。
@@ -736,6 +810,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # 「查無結果」與「連線失敗」必須分清楚，否則使用者會把被擋的網路
     # 誤讀成「這個主題沒有文獻」。
+    if http.middlebox_hosts:
+        hosts = "、".join(sorted(http.middlebox_hosts))
+        print(f"\n提示：{hosts} 回應 HTTP 406。實測這是校園網路閘道或防毒軟體的"
+              f"網頁防護插入的，不是對方服務或本腳本的問題，重試也不會變好。"
+              f"換一個網路環境，或先用 --sources openalex,s2 跳過該來源"
+              f"（影響見 SKILL.md）。", file=sys.stderr)
     if http.failures:
         print(f"\n警告：有 {http.failures} 個 API 請求在重試後仍失敗，"
               f"本次結果可能不完整。請檢查網路或 proxy 設定後重跑。", file=sys.stderr)
@@ -753,14 +833,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 驗證層 ----
     if not args.no_verify:
-        print(f"\nCrossref 逐筆對帳（{len(kept)} 筆）")
+        print(f"\n逐筆對帳：Crossref，查無再查 DataCite（{len(kept)} 筆）")
         for i, rec in enumerate(kept, start=1):
-            verify_with_crossref(http, rec, args.title_threshold)
+            verify_record(http, rec, args.title_threshold)
             if args.verbose or rec.verification != "已驗證":
                 print(f"   [{i}/{len(kept)}] {rec.verification}｜"
                       f"{rec.title[:60]}｜{rec.verify_note}")
     else:
-        print("\n（已跳過 Crossref 驗證，所有書目維持「未驗證」）")
+        print("\n（已跳過 DOI 對帳驗證，所有書目維持「未驗證」）")
 
     # ---- 全文層 ----
     if not args.no_oa:
@@ -770,7 +850,8 @@ def main(argv: list[str] | None = None) -> int:
             fetch_oa(http, rec)
 
     # 已驗證優先、再依引用數排序
-    order = {"已驗證": 0, "未驗證": 1, "欄位不符": 2, "查無此文": 3}
+    order = {"已驗證": 0, "已驗證（DataCite）": 1, "未驗證": 2,
+             "欄位不符": 3, "查無此文": 4}
     kept.sort(key=lambda r: (order.get(r.verification, 9), -(r.citations or 0)))
 
     # ---- 輸出 ----
@@ -783,11 +864,13 @@ def main(argv: list[str] | None = None) -> int:
 
     write_csv(csv_path, kept)
     # BibTeX 只輸出可引用的（已驗證 + 無 DOI 未驗證），查無此文與欄位不符不進書目檔
-    citable = [r for r in kept if r.verification in ("已驗證", "未驗證")]
+    citable = [r for r in kept
+               if r.verification in ("已驗證", "已驗證（DataCite）", "未驗證")]
     write_bibtex(bib_path, citable)
 
     counts = {k: sum(1 for r in kept if r.verification == k)
-              for k in ("已驗證", "欄位不符", "查無此文", "未驗證")}
+              for k in ("已驗證", "已驗證（DataCite）", "欄位不符",
+                        "查無此文", "未驗證")}
     rows = ["| 檢索主題 | 來源 | 輪次 | 命中 | 新增 |", "|---|---|---|---|---|"]
     rows += [f"| {r['query']} | {r['source']} | {r['round']} | {r['hits']} | {r['new']} |"
              for r in round_log]
@@ -809,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
         "deduped": deduped,
         "filtered": len(kept),
         "verified": counts["已驗證"],
+        "verified_datacite": counts["已驗證（DataCite）"],
         "mismatch": counts["欄位不符"],
         "notfound": counts["查無此文"],
         "unverified": counts["未驗證"],
@@ -817,7 +901,8 @@ def main(argv: list[str] | None = None) -> int:
         "http_failures": http.failures,
     })
 
-    print(f"\n完成。已驗證 {counts['已驗證']} 筆、"
+    print(f"\n完成。已驗證 {counts['已驗證']} 筆"
+          f"（另有 DataCite 登記 {counts['已驗證（DataCite）']} 筆）、"
           f"欄位不符 {counts['欄位不符']} 筆、"
           f"查無此文 {counts['查無此文']} 筆、"
           f"無 DOI 未驗證 {counts['未驗證']} 筆")
@@ -828,8 +913,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    # ponytail: Windows 主控台常用 cp950，論文標題常含 cp950 編不到的
-    # Unicode 標點（如 ‐），改用 replace 避免整條管線因單一字元當機
+    # Windows 主控台常用 cp950，論文標題常含 cp950 編不到的 Unicode 標點
+    # （如 U+2010 連字號），改用 replace 避免整條管線因單一字元當機
     sys.stdout.reconfigure(errors="replace")
     sys.stderr.reconfigure(errors="replace")
     sys.exit(main())

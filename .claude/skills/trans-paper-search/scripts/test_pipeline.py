@@ -264,10 +264,30 @@ CR_DB = {
 }
 
 
+DC_DB = {
+    # arXiv 的 DOI 走 DataCite 登記，Crossref 查不到
+    "10.48550/arxiv.2401.12345": {"data": {"attributes": {
+        "titles": [{"title": "Deep RL for Traffic Signal Control"}],
+        "publicationYear": 2024, "publisher": "arXiv"}}},
+    # 標題對不上的 DataCite 記錄
+    "10.5281/zenodo.999": {"data": {"attributes": {
+        "titles": [{"title": "An Unrelated Dataset About Whales"}],
+        "publicationYear": 2020, "publisher": "Zenodo"}}},
+    # publisher 為物件的新版 schema
+    "10.5281/zenodo.777": {"data": {"attributes": {
+        "titles": [{"lang": "en"}, {"title": "Object Publisher Record"}],
+        "publicationYear": 2023, "publisher": {"name": "Zenodo"}}}},
+}
+
+
 def cr_handler(url, params, headers):
-    ok(url.startswith(S.CROSSREF_API), "只應呼叫 Crossref")
-    ok(params.get("mailto"), "Crossref 呼叫應帶 mailto")
-    return CR_DB.get(url[len(S.CROSSREF_API):].replace("%2F", "/"))
+    """Crossref 查得到就回，查不到再讓 DataCite 回。"""
+    if url.startswith(S.CROSSREF_API):
+        ok(params.get("mailto"), "Crossref 呼叫應帶 mailto")
+        return CR_DB.get(url[len(S.CROSSREF_API):].replace("%2F", "/"))
+    if url.startswith(S.DATACITE_API):
+        return DC_DB.get(url[len(S.DATACITE_API):].replace("%2F", "/"))
+    raise AssertionError("未預期的 URL " + url)
 
 
 @test
@@ -275,52 +295,112 @@ def t_verify_states():
     h = FakeHttp(cr_handler)
 
     r = rec(title="Deep RL for traffic signal control - a survey", doi="10.1/ok", year=2019)
-    S.verify_with_crossref(h, r, 0.90)
+    S.verify_record(h, r, 0.90)
     eq(r.verification, "已驗證", "標題與年份吻合")
     eq(r.title, "Deep RL for Traffic Signal Control: A Survey", "應以 Crossref 標題覆寫")
     eq(r.venue, "Transportation Research Part C", "應以 Crossref 期刊覆寫")
     eq(r.year, 2019, "年份覆寫")
 
     r = rec(title="Mismatch", doi="10.1/wrongtitle", year=2021)
-    S.verify_with_crossref(h, r, 0.90)
+    S.verify_record(h, r, 0.90)
     eq(r.verification, "欄位不符", "標題差異過大")
     contains(r.verify_note, "標題相似度", "應說明原因")
-    eq(r.crossref_title, "A Study of Marine Biology", "保留 Crossref 原值供人工判讀")
+    eq(r.authority_title, "A Study of Marine Biology", "保留註冊機構原值供人工判讀")
+    eq(r.registry, "Crossref", "應記錄是哪個註冊機構對上的")
 
     r = rec(title="Same Title Here", doi="10.1/yearoff", year=2021)
-    S.verify_with_crossref(h, r, 0.90)
+    S.verify_record(h, r, 0.90)
     eq(r.verification, "欄位不符", "年份差超過一年")
     contains(r.verify_note, "年份不符", "應說明原因")
 
     r = rec(title="Same Title Here", doi="10.1/yearoff", year=2011)
-    S.verify_with_crossref(h, r, 0.90)
+    S.verify_record(h, r, 0.90)
     eq(r.verification, "已驗證", "年份差 1 年應容忍")
 
     r = rec(title="Ghost paper", doi="10.9/nope", year=2023)
-    S.verify_with_crossref(h, r, 0.90)
+    S.verify_record(h, r, 0.90)
     eq(r.verification, "查無此文", "Crossref 查不到")
-    contains(r.verify_note, "不可直接寫進文獻回顧", "應警告")
+    contains(r.verify_note, "Crossref 與 DataCite 都查不到", "應說明兩邊都查過")
 
     r = rec(title="Preprint", doi="", year=2021)
-    S.verify_with_crossref(h, r, 0.90)
+    S.verify_record(h, r, 0.90)
     eq(r.verification, "未驗證", "無 DOI")
-    contains(r.verify_note, "無 DOI", "應說明原因")
+    contains(r.verify_note, "無 DOI，無法向註冊機構對帳", "應說明原因")
+    eq(r.registry, "", "無 DOI 時不該有註冊機構")
 
     # Crossref 沒給標題時不應誤判為欄位不符
     r = rec(title="Whatever", doi="10.1/notitle", year=2021)
-    S.verify_with_crossref(h, r, 0.90)
+    S.verify_record(h, r, 0.90)
     eq(r.verification, "已驗證", "Crossref 無標題時不以標題否決")
     eq(r.title, "Whatever", "無 Crossref 標題時保留原標題")
+
+
+@test
+def t_verify_datacite_fallback():
+    """Crossref 查無時改查 DataCite：arXiv、Zenodo 的 DOI 是真實存在的。"""
+    h = FakeHttp(cr_handler)
+
+    r = rec(title="Deep RL for traffic signal control", year=2024,
+            doi="10.48550/arXiv.2401.12345")
+    S.verify_record(h, r, 0.90)
+    eq(r.verification, "已驗證（DataCite）", "DataCite 登記的 DOI 不該被判為查無此文")
+    eq(r.registry, "DataCite", "應記錄註冊機構")
+    eq(r.venue, "arXiv", "應以 DataCite 的 publisher 當發表處")
+    eq(r.year, 2024, "年份覆寫")
+    eq(r.title, "Deep RL for Traffic Signal Control", "標題覆寫")
+
+    # DataCite 也有此 DOI，但標題對不上 → 欄位不符，而非查無此文
+    r = rec(title="Bus Bunching in Taipei", year=2020, doi="10.5281/zenodo.999")
+    S.verify_record(h, r, 0.90)
+    eq(r.verification, "欄位不符", "DataCite 有此 DOI 但標題不符")
+    contains(r.verify_note, "DataCite 有此 DOI", "應說明是哪個機構有")
+
+    # 兩邊都查不到才是查無此文
+    r = rec(title="Ghost", year=2023, doi="10.9999/nowhere")
+    S.verify_record(h, r, 0.90)
+    eq(r.verification, "查無此文", "兩邊都查無")
+
+    # publisher 為物件、titles 首項缺 title 的新版 schema
+    r = rec(title="Object Publisher Record", year=2023, doi="10.5281/zenodo.777")
+    S.verify_record(h, r, 0.90)
+    eq(r.verification, "已驗證（DataCite）", "應容忍新版 schema")
+    eq(r.venue, "Zenodo", "publisher 為物件時取 name")
+
+
+@test
+def t_verify_prefers_crossref_and_skips_datacite_when_found():
+    """Crossref 查到就不該再多打一次 DataCite。"""
+    seen = []
+
+    def handler(url, params, headers):
+        seen.append("cr" if url.startswith(S.CROSSREF_API) else "dc")
+        return cr_handler(url, params, headers)
+
+    h = FakeHttp(handler)
+    r = rec(title="Deep RL for traffic signal control - a survey",
+            doi="10.1/ok", year=2019)
+    S.verify_record(h, r, 0.90)
+    eq(seen, ["cr"], "Crossref 命中後不應再查 DataCite")
+    eq(r.registry, "Crossref", "註冊機構")
+
+
+@test
+def t_fetch_helpers_return_none_on_missing():
+    h = FakeHttp(cr_handler)
+    eq(S.fetch_crossref(h, "10.9/none"), None, "Crossref 查無回 None")
+    eq(S.fetch_datacite(h, "10.9/none"), None, "DataCite 查無回 None")
+    eq(S.fetch_crossref(h, "10.1/ok")[1], 2019, "Crossref 年份")
+    eq(S.fetch_datacite(h, "10.48550/arxiv.2401.12345")[2], "arXiv", "DataCite publisher")
 
 
 @test
 def t_verify_threshold_is_configurable():
     h = FakeHttp(cr_handler)
     r1 = rec(title="A Study of Marine Life", doi="10.1/wrongtitle", year=2021)
-    S.verify_with_crossref(h, r1, 0.99)
+    S.verify_record(h, r1, 0.99)
     eq(r1.verification, "欄位不符", "高門檻應否決")
     r2 = rec(title="A Study of Marine Life", doi="10.1/wrongtitle", year=2021)
-    S.verify_with_crossref(h, r2, 0.50)
+    S.verify_record(h, r2, 0.50)
     eq(r2.verification, "已驗證", "低門檻應通過")
 
 
@@ -410,6 +490,19 @@ def t_http_404_is_an_answer_not_a_failure():
         eq(h.get_json("https://x/y"), None, "404 回 None")
         eq(h.failures, 0, "404 是『查無此文』，不算連線失敗")
         eq(h.calls, 1, "404 不應重試")
+    finally:
+        restore()
+
+
+@test
+def t_http_406_not_retried_and_host_recorded():
+    """406 是中間設備插入的，重試只會白等退避時間。"""
+    h, restore = make_http_with_responses([http_error(406)])
+    try:
+        eq(h.get_json("https://export.arxiv.org/api/query?x=1"), None, "406 回 None")
+        eq(h.calls, 1, "406 不應重試")
+        eq(h.failures, 1, "應計失敗")
+        eq(h.middlebox_hosts, {"export.arxiv.org"}, "應記下疑似被阻擋的主機")
     finally:
         restore()
 
@@ -624,7 +717,8 @@ def t_main_patience_stop():
                                  "cited_by_count": 3}]}
         if url.startswith(S.ARXIV_API):
             return '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
-        if url.startswith(S.CROSSREF_API) or url.startswith(S.UNPAYWALL_API):
+        if (url.startswith(S.CROSSREF_API) or url.startswith(S.DATACITE_API)
+                or url.startswith(S.UNPAYWALL_API)):
             return None
         return {"data": []}
 
@@ -658,7 +752,8 @@ def t_main_target_stop():
                 for i in range(5)]}
         if url.startswith(S.ARXIV_API):
             return '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
-        if url.startswith(S.CROSSREF_API) or url.startswith(S.UNPAYWALL_API):
+        if (url.startswith(S.CROSSREF_API) or url.startswith(S.DATACITE_API)
+                or url.startswith(S.UNPAYWALL_API)):
             return None
         return {"data": []}
 
@@ -765,6 +860,12 @@ S2_FIXTURE = {"data": [
     {"paperId": "p2", "title": "Signal Coordination in Urban Arterials", "year": 2021,
      "venue": "TRB Annual Meeting", "citationCount": 12, "externalIds": {},
      "authors": [{"name": "Hsu, Chia"}], "abstract": "no doi", "openAccessPdf": {}},
+    # S2 帶回 arXiv 預印本，附的是 DataCite 登記的 DOI（Crossref 必然查無）
+    {"paperId": "p3", "title": "Graph Neural Networks for Traffic Forecasting",
+     "year": 2024, "venue": "arXiv", "citationCount": 30,
+     "externalIds": {"DOI": "10.48550/arXiv.2401.99999"},
+     "authors": [{"name": "Kuo, Ping"}], "abstract": "preprint via s2",
+     "openAccessPdf": {}},
 ]}
 
 ARXIV_FIXTURE = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -779,6 +880,12 @@ E2E_CR = {
         "title": ["Deep reinforcement learning for traffic signal control: A survey"],
         "container-title": ["Transportation Research Part C: Emerging Technologies"],
         "issued": {"date-parts": [[2019, 3]]}}},
+}
+
+E2E_DC = {
+    "10.48550/arxiv.2401.99999": {"data": {"attributes": {
+        "titles": [{"title": "Graph Neural Networks for Traffic Forecasting"}],
+        "publicationYear": 2024, "publisher": "arXiv"}}},
 }
 
 E2E_UNPAY = {
@@ -796,6 +903,8 @@ def e2e_handler(url, params, headers):
         return ARXIV_FIXTURE if params.get("start") == 0 else None
     if url.startswith(S.CROSSREF_API):
         return E2E_CR.get(url[len(S.CROSSREF_API):].replace("%2F", "/"))
+    if url.startswith(S.DATACITE_API):
+        return E2E_DC.get(url[len(S.DATACITE_API):].replace("%2F", "/"))
     if url.startswith(S.UNPAYWALL_API):
         return E2E_UNPAY.get(url[len(S.UNPAYWALL_API):].replace("%2F", "/"))
     raise AssertionError("未預期的 URL " + url)
@@ -844,7 +953,7 @@ def t_main_end_to_end():
     # 驗證四態
     contains(csv_t, "已驗證", "應有已驗證書目")
     contains(csv_t, "查無此文", "應標記查無此文")
-    contains(csv_t, "無 DOI，Crossref 無法對帳", "應標記無 DOI 未驗證")
+    contains(csv_t, "無 DOI，無法向註冊機構對帳", "應標記無 DOI 未驗證")
     # Crossref 權威欄位覆寫
     contains(csv_t, "A survey", "已驗證書目應以 Crossref 標題覆寫")
     contains(csv_t, "Emerging Technologies", "應以 Crossref 期刊名覆寫")
@@ -856,6 +965,12 @@ def t_main_end_to_end():
     absent(bib_t, "10.9/fake", "查無此文不得進 BibTeX")
     absent(bib_t, "Does Not Exist", "查無此文不得進 BibTeX")
     contains(bib_t, "@misc{hsu2021signal", "無 DOI 者應為 @misc")
+    # DataCite 登記的預印本：可引用，必須進 BibTeX，不可被誤判為查無此文
+    contains(csv_t, "已驗證（DataCite）", "DataCite 登記的 DOI 應標為已驗證（DataCite）")
+    contains(csv_t, "10.48550/arxiv.2401.99999", "DataCite 那筆應留在 CSV")
+    contains(bib_t, "10.48550/arxiv.2401.99999", "DataCite 那筆必須進 BibTeX")
+    contains(bib_t, "note = {trans-paper-search: 已驗證（DataCite）}",
+             "BibTeX 的 note 應標明是 DataCite 登記")
     # 檢索紀錄
     for section in ["檢索條件", "逐輪命中紀錄", "篩選與驗證結果", "誠實的邊界", "API 呼叫統計"]:
         contains(log_t, section, "檢索紀錄章節")
@@ -864,6 +979,8 @@ def t_main_end_to_end():
     contains(log_t, "| 最低引用數 | 5 |", "應記錄引用數門檻")
     contains(log_t, "TRID", "邊界說明應點名未涵蓋的來源")
     contains(log_t, "重試後仍失敗的請求數：0", "應記錄失敗數")
+    contains(log_t, "已驗證（DataCite 登記，如 arXiv、Zenodo） | 1",
+             "檢索紀錄應分開統計 DataCite 已驗證")
     # 排序：已驗證在前
     body = [l for l in csv_t.splitlines()[1:] if l.strip()]
     ok(body[0].startswith("已驗證"), "已驗證應排在最前")
@@ -890,7 +1007,7 @@ def t_main_no_verify_and_no_oa():
     absent(csv_t, "已驗證", "跳過驗證時不應出現已驗證")
     absent(csv_t, "查無此文", "跳過驗證時不應判定查無此文")
     absent(csv_t, "https://arxiv.org/pdf/1904.pdf", "跳過取全文時不應有 OA 連結")
-    contains(out, "已跳過 Crossref 驗證", "應提示已跳過驗證")
+    contains(out, "已跳過 DOI 對帳驗證", "應提示已跳過驗證")
 
 
 @test
