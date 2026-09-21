@@ -1,6 +1,6 @@
 ---
 name: trans-paper-search
-description: 交通運輸領域的文獻檢索與驗證管線。並列檢索 OpenAlex + Semantic Scholar + arXiv，以 DOI 去重，逐筆回 Crossref 對帳驗證，再用 Unpaywall 取合法開放取用全文，輸出 CSV、BibTeX 與可貼進論文方法章節的檢索紀錄。當使用者要找交通、運輸、ITS、號誌控制、運輸規劃、交通安全、物流等主題的學術文獻，或要求「可驗證／不會有假引用／附 DOI／可寫進方法章節」的文獻清單時使用。也適用於任何需要書目驗證的系統性文獻檢索。
+description: 交通運輸領域的文獻檢索與驗證管線。並列檢索 OpenAlex + Semantic Scholar + arXiv，以 DOI 去重，逐筆回 Crossref 對帳驗證（查無再查 DataCite，涵蓋 arXiv、Zenodo 等），再用 Unpaywall 取合法開放取用全文，輸出 CSV、BibTeX 與可貼進論文方法章節的檢索紀錄。當使用者要找交通、運輸、ITS、號誌控制、運輸規劃、交通安全、物流等主題的學術文獻，或要求「可驗證／不會有假引用／附 DOI／可寫進方法章節」的文獻清單時使用。也適用於任何需要書目驗證的系統性文獻檢索。
 ---
 
 # trans-paper-search
@@ -70,7 +70,7 @@ python3 .claude/skills/trans-paper-search/scripts/search.py \
 | `--per-page` | 50 | 每輪每來源擷取筆數 |
 | `--max-rounds` | 4 | 每來源最多輪數 |
 | `--patience` | 2 | 連續幾輪無新命中即停止 |
-| `--title-threshold` | 0.90 | Crossref 對帳的標題相似度門檻 |
+| `--title-threshold` | 0.90 | 向註冊機構對帳的標題相似度門檻 |
 | `--no-verify` / `--no-oa` | 關 | 跳過 DOI 對帳／取全文（**不建議跳過驗證**） |
 
 停止條件是「連續 `--patience` 輪沒有新命中就停手」，加上累積達 `--target` 三倍候選即停（留餘裕給後續篩選與驗證淘汰）。檢索函式是產生器，所以停止條件會**真的不再發出後續請求**，而不是抓完才丟棄——這對 OpenAlex polite pool 與 Semantic Scholar 的限流都有意義。
@@ -113,7 +113,7 @@ BibTeX 檔輸出「已驗證」、「已驗證（DataCite）」與「未驗證�
 - **臺灣本土來源**：臺灣博碩士論文知識加值系統、華藝 Airiti／CEPS（《運輸計劃季刊》《運輸學刊》）、GRB 政府研究資訊系統、交通部運輸研究所出版品、中華民國運輸學會年會論文集。這塊 OpenAlex 完全空白，但口試委員一定會問。
 - **實證資料（非文獻）**：TDX 運輸資料流通服務平臺、交通部統計查詢網、OECD ITF、Eurostat。
 
-這些來源沒有 DOI 可回 Crossref 對帳，是整條鏈裡可稽核性最弱的一環，人工確認來源網址與年份後才可引用。
+這些來源沒有 DOI 可回註冊機構對帳，是整條鏈裡可稽核性最弱的一環，人工確認來源網址與年份後才可引用。
 
 取全文一律走 Unpaywall 的合法 OA 連結或校內訂閱 proxy，**不要**使用 Sci-Hub 之類的來源。
 
@@ -151,7 +151,7 @@ python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py -v   # 逐項
 - `--patience` 與 `--target` 停止條件確實減少 API 請求次數
 - BibTeX：entry 類型、citation key 取姓、key 衝突加序號、LaTeX 特殊字元單次轉義
 - CSV 的中文書目往返與欄位順序
-- `main()` 端到端：跨來源去重、篩選、四種驗證狀態、Crossref 欄位覆寫、OA 連結、BibTeX 排除規則、檢索紀錄章節、排序、多關鍵字合併、`--no-verify`／`--no-oa`、來源選擇、參數錯誤的離場碼
+- `main()` 端到端：跨來源去重、篩選、五種驗證狀態、註冊機構欄位覆寫、OA 連結、BibTeX 排除規則、檢索紀錄章節、排序、多關鍵字合併、`--no-verify`／`--no-oa`、來源選擇、參數錯誤的離場碼
 - 「查無文獻」（exit 0）與「連線失敗」（exit 3）必須區分
 
 > 這套測試不含對真實 API 的呼叫。第一次在自己的網路環境使用前，建議先
