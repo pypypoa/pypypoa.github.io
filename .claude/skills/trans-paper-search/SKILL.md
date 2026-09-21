@@ -71,7 +71,7 @@ python3 .claude/skills/trans-paper-search/scripts/search.py \
 | `--title-threshold` | 0.90 | Crossref 對帳的標題相似度門檻 |
 | `--no-verify` / `--no-oa` | 關 | 跳過驗證／取全文（**不建議跳過驗證**） |
 
-停止條件是「連續 `--patience` 輪沒有新命中就停手」，加上累積達 `--target` 三倍候選即停（留餘裕給後續篩選與驗證淘汰）。
+停止條件是「連續 `--patience` 輪沒有新命中就停手」，加上累積達 `--target` 三倍候選即停（留餘裕給後續篩選與驗證淘汰）。檢索函式是產生器，所以停止條件會**真的不再發出後續請求**，而不是抓完才丟棄——這對 OpenAlex polite pool 與 Semantic Scholar 的限流都有意義。
 
 ## 輸出與判讀
 
@@ -116,11 +116,28 @@ BibTeX 檔只輸出「已驗證」與「未驗證」兩類，「查無此文」�
 
 ## 離線測試
 
-改動腳本後跑這支煙霧測試（用假 API 回應，不需網路）：
+改動腳本後跑這套測試（以假 API 回應取代網路，不需連線）：
 
 ```bash
-python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py
+python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py      # 摘要
+python3 .claude/skills/trans-paper-search/scripts/test_pipeline.py -v   # 逐項
 ```
 
-它會驗證跨來源去重（含 DOI 大小寫不同與缺 DOI 的情形）、三種篩選條件、
-Crossref 四種驗證狀態、BibTeX 不收錄「查無此文」、以及檢索紀錄的必要章節。
+共 40 項，涵蓋：
+
+- 標題／DOI 正規化、相似度、作者姓名三種格式（`Wei, Hua`／`Hua Wei`／中文）
+- OpenAlex 反向索引摘要還原
+- 去重：DOI 大小寫與前綴差異、有 DOI 與無 DOI 的雙向合併、三來源接續合併後的索引重建、不同文獻不被誤併
+- 三種篩選條件與排除清單的正規化
+- Crossref 四種驗證狀態、年份容差、相似度門檻可調、Crossref 未提供標題時不誤判
+- Unpaywall 的 PDF／landing page 取用優先序與無 DOI 略過
+- HTTP 層：429／5xx 退避重試、404 視為有效答案不重試也不計失敗、其他 4xx 不重試、連線失敗計數、畸形 JSON 與畸形 XML
+- 三個來源的參數下達（mailto、年限、offset、API key）與分頁前進／停止
+- `--patience` 與 `--target` 停止條件確實減少 API 請求次數
+- BibTeX：entry 類型、citation key 取姓、key 衝突加序號、LaTeX 特殊字元單次轉義
+- CSV 的中文書目往返與欄位順序
+- `main()` 端到端：跨來源去重、篩選、四種驗證狀態、Crossref 欄位覆寫、OA 連結、BibTeX 排除規則、檢索紀錄章節、排序、多關鍵字合併、`--no-verify`／`--no-oa`、來源選擇、參數錯誤的離場碼
+- 「查無文獻」（exit 0）與「連線失敗」（exit 3）必須區分
+
+> 這套測試不含對真實 API 的呼叫。第一次在自己的網路環境使用前，建議先
+> `--max-rounds 1 --target 5 -v` 小跑一次，確認五個 API 都通得到。

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import os
@@ -29,6 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -222,9 +224,12 @@ def reconstruct_abstract(inverted: dict | None) -> str:
 
 
 def search_openalex(http: Http, query: str, rounds: int, per_page: int,
-                    from_year: int | None) -> list[list[Record]]:
-    """回傳每輪的結果（未去重）。"""
-    out = []
+                    from_year: int | None) -> Iterator[list[Record]]:
+    """逐輪產出結果（未去重）。
+
+    刻意用產生器而非一次回傳全部：呼叫端的停止條件（patience／目標筆數）
+    才能真的省下後續的 API 請求，而不是抓完才丟掉。
+    """
     for page in range(1, rounds + 1):
         params = {
             "search": query,
@@ -254,14 +259,13 @@ def search_openalex(http: Http, query: str, rounds: int, per_page: int,
                 url=it.get("id") or "",
                 sources=["OpenAlex"],
             ))
-        out.append(batch)
+        yield batch
         if len(items) < per_page:
-            break
-    return out
+            return  # 未滿一頁表示沒有下一頁了
 
 
 def search_semantic_scholar(http: Http, query: str, rounds: int, per_page: int,
-                            from_year: int | None) -> list[list[Record]]:
+                            from_year: int | None) -> Iterator[list[Record]]:
     api_key = os.environ.get("S2_API_KEY", "").strip()
     headers = {"x-api-key": api_key} if api_key else None
     # 無 key 時 Semantic Scholar 限流很嚴，放慢節奏
@@ -269,7 +273,6 @@ def search_semantic_scholar(http: Http, query: str, rounds: int, per_page: int,
     if not api_key:
         http.delay = max(http.delay, 1.2)
 
-    out = []
     try:
         for r in range(rounds):
             params = {
@@ -298,17 +301,16 @@ def search_semantic_scholar(http: Http, query: str, rounds: int, per_page: int,
                          if it.get("paperId") else oa.get("url", "")),
                     sources=["Semantic Scholar"],
                 ))
-            out.append(batch)
+            yield batch
             if len(items) < min(per_page, 100):
-                break
+                return
     finally:
+        # 呼叫端提前 break 時，產生器關閉也會走到這裡
         http.delay = delay_backup
-    return out
 
 
 def search_arxiv(http: Http, query: str, rounds: int, per_page: int,
-                 from_year: int | None) -> list[list[Record]]:
-    out = []
+                 from_year: int | None) -> Iterator[list[Record]]:
     for r in range(rounds):
         params = {
             "search_query": f'all:"{query}"',
@@ -319,13 +321,13 @@ def search_arxiv(http: Http, query: str, rounds: int, per_page: int,
         }
         text = http.get_text(ARXIV_API, params, {"Accept": "application/atom+xml"})
         if not text:
-            out.append([])
-            break
+            yield []
+            return
         try:
             root = ET.fromstring(text)
         except ET.ParseError:
-            out.append([])
-            break
+            yield []
+            return
         entries = root.findall(f"{ATOM}entry")
         batch = []
         for e in entries:
@@ -346,10 +348,9 @@ def search_arxiv(http: Http, query: str, rounds: int, per_page: int,
                 url=(e.findtext(f"{ATOM}id") or "").strip(),
                 sources=["arXiv"],
             ))
-        out.append(batch)
+        yield batch
         if len(entries) < per_page:
-            break
-    return out
+            return
 
 
 SEARCHERS = {
@@ -527,8 +528,18 @@ def bibtex_key(rec: Record, used: set[str]) -> str:
     return key
 
 
+# LaTeX 特殊字元。用單次逐字掃描而非連續 replace，否則先換成的
+# \textbackslash{} 裡的大括號會被後面的規則再轉義一次。
+BIB_ESCAPES = {
+    "\\": r"\textbackslash{}",
+    "{": r"\{", "}": r"\}", "$": r"\$", "&": r"\&", "%": r"\%",
+    "#": r"\#", "_": r"\_", "~": r"\textasciitilde{}",
+    "^": r"\textasciicircum{}",
+}
+
+
 def bib_escape(s: str) -> str:
-    return s.replace("\\", "\\textbackslash{}").replace("{", "\\{").replace("}", "\\}")
+    return "".join(BIB_ESCAPES.get(c, c) for c in s)
 
 
 def write_bibtex(path: str, records: list[Record]) -> None:
@@ -696,25 +707,29 @@ def main(argv: list[str] | None = None) -> int:
         for key in source_keys:
             label, fn = SEARCHERS[key]
             print(f"-- {label}")
-            batches = fn(http, query, args.max_rounds, args.per_page, args.from_year)
             stale = 0
-            for idx, batch in enumerate(batches, start=1):
-                new = sum(1 for rec in batch if deduper.add(rec))
-                raw_total += len(batch)
-                round_log.append({
-                    "query": query, "source": label, "round": idx,
-                    "hits": len(batch), "new": new,
-                })
-                print(f"   第 {idx} 輪：命中 {len(batch)} 筆，新增 {new} 筆"
-                      f"（累計 {len(deduper.records())} 筆）")
-                stale = stale + 1 if new == 0 else 0
-                if stale >= args.patience:
-                    print(f"   連續 {stale} 輪無新命中 → 停止本來源")
-                    break
-                if len(deduper.records()) >= args.target * 3:
-                    # 留 3 倍餘裕給後續篩選與驗證淘汰
-                    print("   已累積足夠候選 → 停止本來源")
-                    break
+            batches = fn(http, query, args.max_rounds, args.per_page, args.from_year)
+            # batches 是產生器：下面的 break 會真的停止後續 API 請求。
+            # 用 closing 確保提前中止時產生器的 finally 立刻執行
+            # （Semantic Scholar 的節流設定靠它還原），不必等 GC。
+            with contextlib.closing(batches):
+                for idx, batch in enumerate(batches, start=1):
+                    new = sum(1 for rec in batch if deduper.add(rec))
+                    raw_total += len(batch)
+                    round_log.append({
+                        "query": query, "source": label, "round": idx,
+                        "hits": len(batch), "new": new,
+                    })
+                    print(f"   第 {idx} 輪：命中 {len(batch)} 筆，新增 {new} 筆"
+                          f"（累計 {len(deduper.records())} 筆）")
+                    stale = stale + 1 if new == 0 else 0
+                    if stale >= args.patience:
+                        print(f"   連續 {stale} 輪無新命中 → 停止本來源")
+                        break
+                    if len(deduper.records()) >= args.target * 3:
+                        # 留 3 倍餘裕給後續篩選與驗證淘汰
+                        print("   已累積足夠候選 → 停止本來源")
+                        break
 
     records = deduper.records()
     deduped = len(records)
